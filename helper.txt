@@ -1,0 +1,284 @@
+# requirements.txt
+"""
+Django==4.2.0
+psycopg2-binary==2.9.5
+uvicorn==0.20.0
+"""
+
+# settings.py
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+SECRET_KEY = 'your-secret-key-here'
+DEBUG = True
+ALLOWED_HOSTS = ['*']
+
+INSTALLED_APPS = [
+    'django.contrib.contenttypes',
+    'django.contrib.auth',
+]
+
+MIDDLEWARE = [
+    'django.middleware.security.SecurityMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'myapp.middleware.TenantMiddleware',
+]
+
+ROOT_URLCONF = 'myapp.urls'
+
+# Database configurations for each tenant
+TENANT_DATABASES = {
+    'tenant1': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'tenant1_db',
+        'USER': 'tenant1_user',
+        'PASSWORD': 'tenant1_pass',
+        'HOST': 'localhost',
+        'PORT': '5432',
+        'CONN_MAX_AGE': 0,
+        'OPTIONS': {
+            'MAX_CONNS': 20,
+        }
+    },
+    'tenant2': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'tenant2_db',
+        'USER': 'tenant2_user',
+        'PASSWORD': 'tenant2_pass',
+        'HOST': 'localhost',
+        'PORT': '5433',
+        'CONN_MAX_AGE': 0,
+        'OPTIONS': {
+            'MAX_CONNS': 20,
+        }
+    },
+    'tenant3': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'tenant3_db',
+        'USER': 'tenant3_user',
+        'PASSWORD': 'tenant3_pass',
+        'HOST': 'localhost',
+        'PORT': '5434',
+        'CONN_MAX_AGE': 0,
+        'OPTIONS': {
+            'MAX_CONNS': 20,
+        }
+    }
+}
+
+DATABASES = {
+    'default': TENANT_DATABASES['tenant1']  # fallback
+}
+
+USE_TZ = True
+
+# myapp/middleware.py
+import threading
+import psycopg2
+from psycopg2 import pool
+from django.conf import settings
+from django.http import JsonResponse
+
+class TenantMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.connection_pools = {}
+        self.lock = threading.Lock()
+        self._initialize_pools()
+
+    def _initialize_pools(self):
+        """Initialize connection pools for each tenant"""
+        for tenant_id, db_config in settings.TENANT_DATABASES.items():
+            try:
+                self.connection_pools[tenant_id] = psycopg2.pool.ThreadedConnectionPool(
+                    1, 20,  # min and max connections
+                    database=db_config['NAME'],
+                    user=db_config['USER'],
+                    password=db_config['PASSWORD'],
+                    host=db_config['HOST'],
+                    port=db_config['PORT']
+                )
+            except Exception as e:
+                print(f"Failed to create pool for {tenant_id}: {e}")
+
+    def __call__(self, request):
+        # Get tenant from x-org header
+        tenant_id = request.headers.get('x-org', 'tenant1')
+        
+        if tenant_id not in self.connection_pools:
+            return JsonResponse({'error': 'Invalid tenant'}, status=400)
+        
+        # Store tenant info in request
+        request.tenant_id = tenant_id
+        request.db_pool = self.connection_pools[tenant_id]
+        
+        return self.get_response(request)
+
+# myapp/database.py
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+
+class DatabaseManager:
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=10)
+    
+    @contextmanager
+    def get_connection(self, pool):
+        """Context manager for database connections"""
+        conn = None
+        try:
+            conn = pool.getconn()
+            yield conn
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            raise e
+        finally:
+            if conn:
+                pool.putconn(conn)
+    
+    async def execute_query(self, pool, query, params=None):
+        """Execute query asynchronously"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor, 
+            self._execute_sync_query, 
+            pool, query, params
+        )
+    
+    def _execute_sync_query(self, pool, query, params=None):
+        """Synchronous query execution"""
+        with self.get_connection(pool) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, params or ())
+                if query.strip().upper().startswith('SELECT'):
+                    columns = [desc[0] for desc in cursor.description]
+                    rows = cursor.fetchall()
+                    return [dict(zip(columns, row)) for row in rows]
+                else:
+                    conn.commit()
+                    return {'affected_rows': cursor.rowcount}
+
+# myapp/views.py
+import json
+import asyncio
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+from django.utils.decorators import method_decorator
+from django.views import View
+from .database import DatabaseManager
+
+db_manager = DatabaseManager()
+
+class AsyncView(View):
+    """Base class for async views"""
+    
+    @method_decorator(csrf_exempt)
+    def dispatch(self, request, *args, **kwargs):
+        return asyncio.run(self.async_dispatch(request, *args, **kwargs))
+    
+    async def async_dispatch(self, request, *args, **kwargs):
+        handler = getattr(self, request.method.lower(), None)
+        if handler:
+            return await handler(request, *args, **kwargs)
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+class UsersView(AsyncView):
+    async def get(self, request):
+        """Get all users"""
+        try:
+            query = "SELECT * FROM users ORDER BY created_at DESC"
+            users = await db_manager.execute_query(request.db_pool, query)
+            return JsonResponse({'users': users})
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=500)
+    
+    async def post(self, request):
+        """Create new user"""
+        try:
+            data = json.loads(request.body)
+            query = "INSERT INTO users (name, email) VALUES (%s, %s) RETURNING *"
+            result = await db_manager.execute_query(
+                request.db_pool, 
+                query, 
+                (data['name'], data['email'])
+            )
+            return JsonResponse({'user': result}, status=201)
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=500)
+
+class ProductsView(AsyncView):
+    async def get(self, request):
+        """Get all products"""
+        try:
+            query = "SELECT * FROM products ORDER BY created_at DESC"
+            products = await db_manager.execute_query(request.db_pool, query)
+            return JsonResponse({'products': products})
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=500)
+    
+    async def post(self, request):
+        """Create new product"""
+        try:
+            data = json.loads(request.body)
+            query = "INSERT INTO products (name, description, price) VALUES (%s, %s, %s) RETURNING *"
+            result = await db_manager.execute_query(
+                request.db_pool, 
+                query, 
+                (data['name'], data['description'], data['price'])
+            )
+            return JsonResponse({'product': result}, status=201)
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=500)
+
+class OrdersView(AsyncView):
+    async def get(self, request):
+        """Get all orders with user details"""
+        try:
+            query = """
+                SELECT o.*, u.name as user_name, u.email as user_email
+                FROM orders o 
+                JOIN users u ON o.user_id = u.id 
+                ORDER BY o.created_at DESC
+            """
+            orders = await db_manager.execute_query(request.db_pool, query)
+            return JsonResponse({'orders': orders})
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=500)
+    
+    async def post(self, request):
+        """Create new order"""
+        try:
+            data = json.loads(request.body)
+            query = "INSERT INTO orders (user_id, total_amount, status) VALUES (%s, %s, %s) RETURNING *"
+            result = await db_manager.execute_query(
+                request.db_pool, 
+                query, 
+                (data['user_id'], data['total_amount'], data.get('status', 'pending'))
+            )
+            return JsonResponse({'order': result}, status=201)
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=500)
+
+# myapp/urls.py
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('users/', views.UsersView.as_view(), name='users'),
+    path('products/', views.ProductsView.as_view(), name='products'),
+    path('orders/', views.OrdersView.as_view(), name='orders'),
+]
+
+# asgi.py
+import os
+from django.core.asgi import get_asgi_application
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'myapp.settings')
+application = get_asgi_application()
+
+# Run with: uvicorn asgi:application --host 0.0.0.0 --port 8000 --workers 4
